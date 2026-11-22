@@ -51,6 +51,7 @@ from gettext import gettext as _
 from .DebPackage import DebPackage
 from .SimpleGtkbuilderApp import SimpleGtkbuilderApp
 from .GDebiCommon import GDebiCommon
+from .PackageKitInstall import PackageKitInstaller
 
 # the timeout when the termial is expanded if no activity from dpkg
 # is happening
@@ -635,6 +636,18 @@ class GDebiGtk(SimpleGtkbuilderApp, GDebiCommon):
                 return
 
         if os.getuid() != 0:
+            # Unprivileged installs go through PackageKit: the actual work
+            # is done by packagekitd as root, polkit authentication is
+            # handled by the desktop session and this process keeps its
+            # unprivileged identity (safe under Wayland).
+            if install and PackageKitInstaller.available():
+                self.install_via_packagekit()
+                return
+            # NOTE: the --remove path has deliberately NOT been migrated
+            # to PackageKit yet, it still uses the pkexec fallback below.
+            # Fallback for when PackageKit is not available; relaunching
+            # the GUI via pkexec is known to fail on Wayland sessions
+            # (root cannot connect to the user display server).
             pkexec_cmd = "/usr/bin/pkexec"
             gdebi_args = ["gdebi-gtk", "--non-interactive",
                           self._deb.filename]
@@ -778,6 +791,103 @@ class GDebiGtk(SimpleGtkbuilderApp, GDebiCommon):
             self.show_alert(Gtk.MessageType.ERROR, err_header, err_body)
         self.open(self._deb.filename)
 
+    def install_via_packagekit(self):
+        """Install self._deb via PackageKit.
+
+        The transaction runs inside packagekitd (as root, with polkit
+        handled by the session); we only display progress and log here.
+        No local apt/dpkg lock is taken - packagekitd serializes the
+        transaction itself and calling acquire_lock() would only race
+        with it, so neither acquire_lock() nor the lock-release dance
+        of the dpkg path is used in this branch.
+        """
+        installer = PackageKitInstaller(self._deb.filename)
+
+        self.window_main.set_sensitive(False)
+        self.button_deb_install_close.set_sensitive(False)
+        self.expander_install.set_expanded(False)
+        self.progressbar_install.set_fraction(0.0)
+        self.progressbar_install.set_text("")
+        self.dialog_deb_install.set_transient_for(self.window_main)
+        self.dialog_deb_install.show_all()
+
+        self.label_action.set_markup("<b><big>" + _("Installing %s") %
+                                     self._deb.pkgname + "</big></b>")
+        self.label_install_status.set_markup(
+            "<i>" + _("Installing '%s'...") %
+            os.path.basename(self._deb.filename) + "</i>")
+
+        installer.connect("progress", self.on_packagekit_progress)
+        installer.connect("log", self.on_packagekit_log)
+        installer.connect("finished", self.on_packagekit_finished)
+        # keep a reference while the async transaction is running
+        self._packagekit_installer = installer
+        installer.start()
+
+    def on_packagekit_progress(self, installer, percentage, status_text):
+        fraction = max(0.0, min(1.0, percentage / 100.0))
+        self.progressbar_install.set_fraction(fraction)
+        if percentage > 0.0:
+            self.progressbar_install.set_text("%d %%" % int(percentage))
+        if status_text:
+            self.label_action.set_markup("<b><big>%s</big></b>" %
+                                         GLib.markup_escape_text(status_text))
+
+    def on_packagekit_log(self, installer, line):
+        # Vte.feed() interprets escape sequences, strip ESC bytes from the
+        # PackageKit text so the log stays readable
+        safe_line = line.replace("\x1b", "")
+        try:
+            self.vte_terminal.feed(safe_line + "\n")
+        except Exception:
+            # no usable terminal, degrade to the plain status label
+            self.label_install_status.set_text(line)
+
+    def on_packagekit_finished(self, installer, success, message):
+        self._packagekit_installer = None
+        self.action_completed = True
+        if success:
+            self.progressbar_install.set_fraction(1.0)
+            self.progressbar_install.set_text("")
+            self.label_action.set_markup("<b><big>" +
+                                         _("Installation finished") +
+                                         "</big></b>")
+            self.label_install_status.set_markup(
+                "<i>" + _("Package '%s' was installed") %
+                os.path.basename(self._deb.filename) + "</i>")
+            self.statusbar_main.push(self.context, _("Installation complete"))
+        else:
+            self.progressbar_install.set_fraction(0.0)
+            header = _("Failed to install package '%s'") % \
+                os.path.basename(self._deb.filename)
+            self.label_install_status.set_markup(
+                "<span foreground=\"red\" weight=\"bold\">%s</span>" %
+                GLib.markup_escape_text(header))
+            self.expander_install.set_expanded(True)
+            self.statusbar_main.push(self.context,
+                                     _("Failed to install package file"))
+            self.show_alert(Gtk.MessageType.ERROR, header, message,
+                            parent=self.dialog_deb_install)
+        # the close button becomes the only action
+        self.button_deb_install_close.set_sensitive(True)
+        self.button_deb_install_close.grab_default()
+        if success and self.checkbutton_autoclose.get_active():
+            self.on_button_deb_install_close_clicked(None)
+            return
+        # reopen the cache, reread the file
+        try:
+            self.openCache()
+            if self._cache._depcache.broken_count > 0:
+                err_header = _("Failed to completely install all dependencies")
+                err_body = _("To fix this run 'sudo apt-get install -f' in a "
+                             "terminal window.")
+                self.show_alert(Gtk.MessageType.ERROR, err_header, err_body,
+                                parent=self.dialog_deb_install)
+            self.open(self._deb.filename)
+        except Exception:
+            logging.exception("reopening the cache after the "
+                              "PackageKit install failed")
+
     def on_button_install_clicked(self, widget):
         self.dpkg_action(widget, True)
 
@@ -793,8 +903,13 @@ class GDebiGtk(SimpleGtkbuilderApp, GDebiCommon):
         # Set the autoclose option when we close
         autoclose = self.checkbutton_autoclose.get_active()
         self.synaptic_config["closeZvt"] = str(autoclose).lower()
-        self.write_synaptic_config_file(self.synaptic_config,
-                                        "/root/.synaptic/synaptic.conf")
+        try:
+            self.write_synaptic_config_file(self.synaptic_config,
+                                            "/root/.synaptic/synaptic.conf")
+        except (IOError, OSError):
+            # the config lives in /root, writing it is expected to fail
+            # when we are not root (PackageKit install path)
+            logging.info("could not write /root/.synaptic/synaptic.conf")
         # FIXME: doesn't turn it off
         #self.window_main.set_property("urgency-hint", 0)
         if hasattr(self, "_gio_cancellable"):
