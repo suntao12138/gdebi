@@ -52,6 +52,7 @@ from .DebPackage import DebPackage
 from .SimpleGtkbuilderApp import SimpleGtkbuilderApp
 from .GDebiCommon import GDebiCommon
 from .PackageKitInstall import PackageKitInstaller
+from .PackageKitInstall import waiting_status_texts
 
 # the timeout when the termial is expanded if no activity from dpkg
 # is happening
@@ -636,15 +637,16 @@ class GDebiGtk(SimpleGtkbuilderApp, GDebiCommon):
                 return
 
         if os.getuid() != 0:
-            # Unprivileged installs go through PackageKit: the actual work
-            # is done by packagekitd as root, polkit authentication is
-            # handled by the desktop session and this process keeps its
-            # unprivileged identity (safe under Wayland).
-            if install and PackageKitInstaller.available():
-                self.install_via_packagekit()
+            # Unprivileged installs and removals go through PackageKit: the
+            # actual work is done by packagekitd as root, polkit
+            # authentication is handled by the desktop session and this
+            # process keeps its unprivileged identity (safe under Wayland).
+            if PackageKitInstaller.available():
+                if install:
+                    self.install_via_packagekit()
+                else:
+                    self.remove_via_packagekit()
                 return
-            # NOTE: the --remove path has deliberately NOT been migrated
-            # to PackageKit yet, it still uses the pkexec fallback below.
             # Fallback for when PackageKit is not available; relaunching
             # the GUI via pkexec is known to fail on Wayland sessions
             # (root cannot connect to the user display server).
@@ -802,7 +804,30 @@ class GDebiGtk(SimpleGtkbuilderApp, GDebiCommon):
         of the dpkg path is used in this branch.
         """
         installer = PackageKitInstaller(self._deb.filename)
+        self._packagekit_remove = False
+        self._start_packagekit(installer, _("Installing %s") %
+                               self._deb.pkgname,
+                               _("Installing '%s'...") %
+                               os.path.basename(self._deb.filename))
 
+    def remove_via_packagekit(self):
+        """Remove the package of self._deb via PackageKit.
+
+        The mirror of install_via_packagekit(): packagekitd does the work
+        as root after a polkit prompt, this process only watches. The
+        dependency check was already done against the apt cache in
+        dpkg_action(), so the PackageKit transaction runs with
+        allow_deps/autoremove disabled.
+        """
+        installer = PackageKitInstaller(self._deb.filename, remove=True,
+                                        pkgname=self._deb.pkgname)
+        self._packagekit_remove = True
+        self._start_packagekit(installer, _("Removing %s") %
+                               self._deb.pkgname,
+                               _("Removing '%s'...") % self._deb.pkgname)
+
+    def _start_packagekit(self, installer, action_text, status_text):
+        """Shared UI setup for the install/remove PackageKit transactions."""
         self.window_main.set_sensitive(False)
         self.button_deb_install_close.set_sensitive(False)
         self.expander_install.set_expanded(False)
@@ -811,17 +836,17 @@ class GDebiGtk(SimpleGtkbuilderApp, GDebiCommon):
         self.dialog_deb_install.set_transient_for(self.window_main)
         self.dialog_deb_install.show_all()
 
-        self.label_action.set_markup("<b><big>" + _("Installing %s") %
-                                     self._deb.pkgname + "</big></b>")
+        self.label_action.set_markup("<b><big>%s</big></b>" %
+                                     GLib.markup_escape_text(action_text))
         self.label_install_status.set_markup(
-            "<i>" + _("Installing '%s'...") %
-            os.path.basename(self._deb.filename) + "</i>")
+            "<i>%s</i>" % GLib.markup_escape_text(status_text))
 
         installer.connect("progress", self.on_packagekit_progress)
         installer.connect("log", self.on_packagekit_log)
         installer.connect("finished", self.on_packagekit_finished)
         # keep a reference while the async transaction is running
         self._packagekit_installer = installer
+        self._packagekit_last_waiting = None
         installer.start()
 
     def on_packagekit_progress(self, installer, percentage, status_text):
@@ -832,6 +857,21 @@ class GDebiGtk(SimpleGtkbuilderApp, GDebiCommon):
         if status_text:
             self.label_action.set_markup("<b><big>%s</big></b>" %
                                          GLib.markup_escape_text(status_text))
+        if status_text in waiting_status_texts():
+            # packagekitd is blocked on a polkit prompt (or on the dpkg
+            # lock): say so in the status line and in the log, otherwise
+            # this looks exactly like a crash. The progress signal repeats
+            # while the daemon waits, so only log on a change.
+            self.label_install_status.set_text(status_text)
+            if status_text != self._packagekit_last_waiting:
+                self._packagekit_last_waiting = status_text
+                # the installer already logged the status itself, this is
+                # the "what you have to do now" follow-up
+                self.on_packagekit_log(
+                    installer,
+                    _("Please confirm the system dialog to continue."))
+        else:
+            self._packagekit_last_waiting = None
 
     def on_packagekit_log(self, installer, line):
         # Vte.feed() interprets escape sequences, strip ESC bytes from the
@@ -844,28 +884,43 @@ class GDebiGtk(SimpleGtkbuilderApp, GDebiCommon):
             self.label_install_status.set_text(line)
 
     def on_packagekit_finished(self, installer, success, message):
+        # read the action flag *before* the installer is dropped
+        removing = getattr(self, "_packagekit_remove", False)
         self._packagekit_installer = None
+        self._packagekit_last_waiting = None
         self.action_completed = True
         if success:
             self.progressbar_install.set_fraction(1.0)
             self.progressbar_install.set_text("")
-            self.label_action.set_markup("<b><big>" +
-                                         _("Installation finished") +
-                                         "</big></b>")
+            self.label_action.set_markup(
+                "<b><big>%s</big></b>" %
+                GLib.markup_escape_text(_("Removal finished") if removing
+                                        else _("Installation finished")))
+            if removing:
+                detail = _("Package '%s' was removed") % self._deb.pkgname
+            else:
+                detail = _("Package '%s' was installed") % \
+                    os.path.basename(self._deb.filename)
             self.label_install_status.set_markup(
-                "<i>" + _("Package '%s' was installed") %
-                os.path.basename(self._deb.filename) + "</i>")
-            self.statusbar_main.push(self.context, _("Installation complete"))
+                "<i>%s</i>" % GLib.markup_escape_text(detail))
+            self.statusbar_main.push(
+                self.context, _("Removal complete") if removing
+                else _("Installation complete"))
         else:
             self.progressbar_install.set_fraction(0.0)
-            header = _("Failed to install package '%s'") % \
-                os.path.basename(self._deb.filename)
+            if removing:
+                header = _("Failed to remove package '%s'") % \
+                    self._deb.pkgname
+                status = _("Failed to remove package")
+            else:
+                header = _("Failed to install package '%s'") % \
+                    os.path.basename(self._deb.filename)
+                status = _("Failed to install package file")
             self.label_install_status.set_markup(
                 "<span foreground=\"red\" weight=\"bold\">%s</span>" %
                 GLib.markup_escape_text(header))
             self.expander_install.set_expanded(True)
-            self.statusbar_main.push(self.context,
-                                     _("Failed to install package file"))
+            self.statusbar_main.push(self.context, status)
             self.show_alert(Gtk.MessageType.ERROR, header, message,
                             parent=self.dialog_deb_install)
         # the close button becomes the only action
