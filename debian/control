@@ -46,6 +46,7 @@ Depends: ${python3:Depends},
          gir1.2-gtk-3.0,
          gir1.2-vte-2.91,
          python3-gi,
+         gir1.2-packagekitglib-1.0,
          pkexec
 Recommends: libgtk2-perl, shared-mime-info, lintian
 Description: simple tool to view and install deb files - GNOME GUI

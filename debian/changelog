@@ -1,3 +1,11 @@
+gdebi (0.9.5.8+pkgkit1) resolute; urgency=medium
+
+  * Local build: install .deb through PackageKit (privileged work in
+    packagekitd, GUI only subscribes to progress) instead of relaunching
+    the GUI via pkexec. Keeps pkexec path as a fallback.
+
+ -- suntao <suntao12138@users.noreply.github.com>  Mon, 23 Nov 2026 15:00:00 +0800
+
 gdebi (0.9.5.8) unstable; urgency=medium
 
   [ Andreas Tille ]
